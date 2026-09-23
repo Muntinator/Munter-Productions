@@ -1,0 +1,2770 @@
+#include <usbdrvce.h>
+#include <srldrvce.h>
+#include <graphx.h>
+#include <keypadc.h>
+#include <tice.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdbool.h>
+#include <stdint.h>
+
+#define PAGE_BYTES       12288
+#define MAX_LINKS        9
+#define MAX_LINK_LEN     240
+#define MAX_LINES        320
+#define TEXT_W_CHARS     42
+#define LINE_H           10
+#define VISIBLE_LINES    12
+
+#define TITLE_H          17
+#define MENU_H           15
+#define TOOL_H           31
+#define URL_H            20
+#define TAB_H            16
+#define CONTENT_Y        99
+#define CONTENT_H        126
+#define STATUS_H         15
+#define STATUS_Y         225
+#define SCROLL_W         14
+
+#define LINK_BLUE        0x03
+#define LIGHT            0xFF
+#define MID              0xC0
+#define SHADOW           0x55
+#define DARK              0x80
+#define BLACK            0x00
+#define BLUE              0x01
+#define WHITE             0xFF
+
+#define KEY_URL          sk_2nd
+#define KEY_BACK         sk_Mode
+#define KEY_SEARCH       sk_Alpha
+#define KEY_MOUSE        sk_Alpha
+#define KEY_MENU         sk_Math
+#define KEY_EXIT         sk_Clear
+#define KEY_PAGE_UP      sk_Div
+#define KEY_PAGE_DOWN    sk_Mul
+#define KEY_FORWARD      10
+
+#define TAB_1_KEY        sk_Yequ
+#define TAB_2_KEY        sk_Window
+#define TAB_3_KEY        sk_Zoom
+#define TAB_4_KEY        sk_Trace
+#define TAB_5_KEY        sk_Graph
+
+#define MAX_HISTORY      10
+#define MAX_FORWARD      10
+#define MAX_FAVORITES    8
+#define MAX_RECENT_SEARCH 6
+#define MAX_MENU_ITEMS   6
+#define MAX_MEDIA        8
+#define MEDIA_IMAGE      1
+#define MEDIA_VIDEO      2
+#define MEDIA_IMAGE_ROWS 6
+#define MEDIA_VIDEO_ROWS 8
+
+typedef struct {
+    usb_device_t device;
+    srl_device_t srl;
+    uint8_t buffer[512];
+    bool open;
+} bridge_state_t;
+
+static bridge_state_t bridge;
+
+static usb_error_t usb_callback(usb_event_t event, void *event_data, void *callback_data) {
+    bridge_state_t *b = callback_data;
+
+    if (event == USB_DEVICE_CONNECTED_EVENT) {
+        b->device = usb_RefDevice((usb_device_t)event_data);
+    } else if (event == USB_DEVICE_DISCONNECTED_EVENT) {
+        usb_device_t d = (usb_device_t)event_data;
+        if (b->device == d) {
+            if (b->open) {
+                srl_Close(&b->srl);
+                b->open = false;
+            }
+            usb_UnrefDevice(b->device);
+            b->device = NULL;
+        }
+    }
+
+    return USB_SUCCESS;
+}
+
+static bool ensure_serial(void) {
+    if (bridge.open) return true;
+    if (!bridge.device) return false;
+
+    if (srl_Open(&bridge.srl,
+                 bridge.device,
+                 bridge.buffer,
+                 sizeof(bridge.buffer),
+                 SRL_INTERFACE_ANY,
+                 115200) != SRL_SUCCESS) {
+        return false;
+    }
+
+    bridge.open = true;
+    return true;
+}
+
+static void bridge_write_line(const char *line) {
+    if (!ensure_serial()) return;
+    srl_Write(&bridge.srl, line, strlen(line));
+    srl_Write(&bridge.srl, "\n", 1);
+}
+
+typedef struct {
+    char url[240];
+    char title[26];
+    bool used;
+} tab_state_t;
+
+static tab_state_t tabs[5];
+static uint8_t active_tab = 0;
+
+static char url[240] = "https://www.cemetech.net/gcn/portal.html";
+static char page_text[PAGE_BYTES];
+static char lines[MAX_LINES][TEXT_W_CHARS + 1];
+static char links[MAX_LINKS][MAX_LINK_LEN];
+static uint16_t line_count = 0;
+static uint16_t first_line = 0;
+static uint8_t link_count = 0;
+static int8_t selected_link = -1;
+
+typedef struct {
+    uint8_t type;
+    char url[240];
+    char label[48];
+    bool playing;
+    uint8_t frame;
+} media_element_t;
+
+static media_element_t media[MAX_MEDIA];
+static uint8_t media_count = 0;
+
+static char rx_line[512];
+static uint16_t rx_len = 0;
+
+static bool running = true;
+static bool loading = false;
+static bool show_error = false;
+static bool showing_help = false;
+static bool showing_about = false;
+static bool showing_url_dialog = false;
+
+static char error_message[180];
+static char status_text[80];
+
+static char back_stack[MAX_HISTORY][240];
+static uint8_t back_count = 0;
+static char forward_stack[MAX_FORWARD][240];
+static uint8_t forward_count = 0;
+
+static char favorites[MAX_FAVORITES][240] = {
+    "https://www.google.com/",
+    "https://www.cemetech.net/",
+    "https://www.cemetech.net/gcn/portal.html"
+};
+static uint8_t favorite_count = 3;
+
+static char recent_search[MAX_RECENT_SEARCH][80];
+static uint8_t recent_search_count = 0;
+
+typedef enum {
+    PANE_NONE = 0,
+    PANE_FAVORITES,
+    PANE_HISTORY,
+    PANE_SEARCH
+} pane_t;
+
+static pane_t active_pane = PANE_NONE;
+static uint8_t pane_selection = 0;
+static uint8_t dialog_mode = 0; 
+
+static int8_t focus_control = 15;
+
+static bool mouse_mode = false;
+static int16_t mouse_x = 156;
+static int16_t mouse_y = 156;
+static uint8_t mouse_speed = 12;
+static int8_t pressed_control = -1;
+static uint8_t pressed_frames = 0;
+
+static bool menu_open = false;
+static uint8_t menu_index = 0;
+static uint8_t menu_item = 0;
+
+#define EDIT_MAX 239
+static char edit_buffer[EDIT_MAX + 1];
+static uint16_t edit_length = 0;
+static uint16_t edit_cursor = 0;
+static bool edit_alpha_lock = true;
+static bool edit_symbol_next = false;
+static bool edit_blink = false;
+static bool edit_replace_all = false;
+
+static const char *menu_names[] = {
+    "File", "Edit", "View", "Go", "Favorites", "Tools", "Help"
+};
+
+static const char *file_items[] = {
+    "Open URL", "New Tab", "Close Tab", "Save Favorite", "Exit", NULL
+};
+static const char *edit_items[] = {
+    "Open URL", "Clear History", "Clear Forward", NULL
+};
+static const char *view_items[] = {
+    "Refresh", "Stop", "Favorites Pane", "History Pane", "Search Pane", NULL
+};
+static const char *go_items[] = {
+    "Back", "Forward", "Home", "Open URL", NULL
+};
+static const char *favorite_items[] = {
+    "Show Favorites", "Save Current", NULL
+};
+static const char *tools_items[] = {
+    "Search", "Internet Status", "About", NULL
+};
+static const char *help_items[] = {
+    "Help", "About", NULL
+};
+
+static const char **menu_list(uint8_t menu) {
+    switch (menu) {
+        case 0: return file_items;
+        case 1: return edit_items;
+        case 2: return view_items;
+        case 3: return go_items;
+        case 4: return favorite_items;
+        case 5: return tools_items;
+        default: return help_items;
+    }
+}
+
+static uint8_t menu_count(uint8_t menu) {
+    const char **p = menu_list(menu);
+    uint8_t n = 0;
+    while (p[n]) ++n;
+    return n;
+}
+
+static void set_status(const char *s) {
+    strncpy(status_text, s, sizeof(status_text) - 1);
+    status_text[sizeof(status_text) - 1] = '\0';
+}
+
+static void clear_page(void) {
+    page_text[0] = '\0';
+    line_count = 0;
+    first_line = 0;
+    link_count = 0;
+    selected_link = -1;
+    rx_len = 0;
+    memset(links, 0, sizeof(links));
+    memset(media, 0, sizeof(media));
+    media_count = 0;
+}
+
+static void wrap_page(void) {
+    line_count = 0;
+    const char *p = page_text;
+    uint16_t limit = (active_pane == PANE_NONE) ? TEXT_W_CHARS : 28;
+
+    while (*p && line_count < MAX_LINES) {
+        if (*p == '\n') {
+            lines[line_count][0] = '\0';
+            ++line_count;
+            ++p;
+            continue;
+        }
+
+        const char *start = p;
+        uint16_t len = 0;
+        uint16_t last_space = 0;
+
+        while (p[len] && p[len] != '\n' && len < limit) {
+            if (p[len] == ' ') last_space = len;
+            ++len;
+        }
+
+        if (p[len] && p[len] != '\n' && len == limit && last_space > 0) {
+            len = last_space;
+        }
+
+        memcpy(lines[line_count], start, len);
+        lines[line_count][len] = '\0';
+        ++line_count;
+
+        p = start + len;
+        while (*p == ' ') ++p;
+        if (*p == '\n') ++p;
+    }
+
+    if (!line_count) {
+        strcpy(lines[0], "(empty page)");
+        line_count = 1;
+    }
+
+    if (first_line >= line_count)
+        first_line = line_count - 1;
+}
+
+static void append_text(const char *text) {
+    size_t used = strlen(page_text);
+    size_t remaining = sizeof(page_text) - used - 1;
+
+    while (*text && remaining) {
+        char c = *text++;
+        if (c == '\r') continue;
+        page_text[used++] = c;
+        --remaining;
+    }
+
+    page_text[used] = '\0';
+    wrap_page();
+}
+
+static void print_clipped(const char *text, int x, int y, uint8_t max_chars);
+static uint8_t clip_chars_for_width(int pixels);
+static void save_active_tab(void);
+static void redraw(void);
+
+static bool is_test_url(const char *u) {
+    const char *p = u;
+
+    if (!strncmp(p, "https://", 8)) p += 8;
+    else if (!strncmp(p, "http://", 7)) p += 7;
+
+    if (!strncmp(p, "www.", 4)) p += 4;
+
+    return !strncmp(p, "test.com", 8) &&
+           (p[8] == '\0' || p[8] == '/');
+}
+
+static void append_media_element(uint8_t type, const char *media_url, const char *label) {
+    if (media_count >= MAX_MEDIA) return;
+
+    uint8_t id = (uint8_t)(media_count + 1);
+    media_element_t *m = &media[media_count++];
+
+    m->type = type;
+    m->playing = false;
+    m->frame = 0;
+    strncpy(m->url, media_url ? media_url : "", sizeof(m->url) - 1);
+    m->url[sizeof(m->url) - 1] = '\0';
+    strncpy(m->label, label ? label : (type == MEDIA_VIDEO ? "Video" : "Image"), sizeof(m->label) - 1);
+    m->label[sizeof(m->label) - 1] = '\0';
+
+    char token[20];
+    snprintf(token, sizeof(token), type == MEDIA_VIDEO ? "[VIDEO%u]" : "[IMAGE%u]", id);
+    append_text(token);
+    append_text("\n");
+
+    uint8_t rows = type == MEDIA_VIDEO ? MEDIA_VIDEO_ROWS : MEDIA_IMAGE_ROWS;
+    for (uint8_t i = 0; i < rows - 1; ++i)
+        append_text("\n");
+}
+
+static int media_token(const char *line) {
+    unsigned n = 0;
+    if (sscanf(line, "[IMAGE%u]", &n) == 1 && n >= 1 && n <= media_count && line[7] == ']')
+        return (int)n;
+    if (sscanf(line, "[VIDEO%u]", &n) == 1 && n >= 1 && n <= media_count && line[7] == ']')
+        return (int)n;
+    return 0;
+}
+
+static void draw_media_image(const media_element_t *m, int x, int y, int max_x, int bottom) {
+    int w = max_x - x;
+    if (w > 188) w = 188;
+    if (w < 100) return;
+
+    int h = bottom - y;
+    if (h > 58) h = 58;
+    if (h < 18) return;
+
+    gfx_SetColor(SHADOW);
+    gfx_FillRectangle(x + 2, y + 2, w, h);
+    gfx_SetColor(WHITE);
+    gfx_FillRectangle(x, y, w, h);
+    gfx_SetColor(BLUE);
+    gfx_Rectangle(x, y, w, h);
+
+    int px = x + 4;
+    int py = y + 4;
+    int pw = w - 8;
+    int ph = h - 25;
+    if (ph > 30) ph = 30;
+
+    gfx_SetColor(0x0B);
+    gfx_FillRectangle(px, py, pw, ph);
+    gfx_SetColor(BLUE);
+    gfx_FillRectangle(px, py, pw, ph / 2);
+    gfx_SetColor(0x0E);
+    gfx_FillRectangle(px + pw - 18, py + 4, 10, 10);
+
+    gfx_SetColor(0x0A);
+    gfx_Line(px, py + ph - 2, px + pw / 3, py + ph - 14);
+    gfx_Line(px + pw / 3, py + ph - 14, px + pw / 2, py + ph - 4);
+    gfx_Line(px + pw / 2, py + ph - 4, px + pw - 5, py + ph - 18);
+
+    gfx_SetTextFGColor(WHITE);
+    gfx_PrintStringXY("IMAGE", px + 4, py + 4);
+
+    gfx_SetTextFGColor(BLACK);
+    print_clipped(m->label, x + 5, y + h - 18, clip_chars_for_width(w - 10));
+    print_clipped(m->url, x + 5, y + h - 9, clip_chars_for_width(w - 10));
+}
+
+static void draw_media_video(const media_element_t *m, int x, int y, int max_x, int bottom) {
+    int w = max_x - x;
+    if (w > 204) w = 204;
+    if (w < 120) return;
+
+    int h = bottom - y;
+    if (h > 74) h = 74;
+    if (h < 20) return;
+
+    gfx_SetColor(SHADOW);
+    gfx_FillRectangle(x + 2, y + 2, w, h);
+    gfx_SetColor(BLACK);
+    gfx_FillRectangle(x, y, w, h);
+    gfx_SetColor(WHITE);
+    gfx_Rectangle(x, y, w, h);
+
+    int px = x + 5;
+    int py = y + 5;
+    int pw = w - 10;
+    int ph = h - 18;
+
+    gfx_SetColor(DARK);
+    gfx_FillRectangle(px, py, pw, ph);
+    gfx_SetColor(BLUE);
+    gfx_FillRectangle(px, py, pw, 8);
+
+    gfx_SetTextFGColor(WHITE);
+    gfx_PrintStringXY("VIDEO", px + 4, py + 1);
+
+    int cx = px + pw / 2;
+    int cy = py + ph / 2;
+    gfx_SetColor(WHITE);
+    gfx_Line(cx - 8, cy - 10, cx - 8, cy + 10);
+    gfx_Line(cx - 8, cy - 10, cx + 9, cy);
+    gfx_Line(cx + 9, cy, cx - 8, cy + 10);
+
+    gfx_SetColor(BLUE);
+    int track = pw - 10;
+    int pos = (track > 0) ? ((int)m->frame * track / 19) : 0;
+    gfx_FillRectangle(px + 5, y + h - 9, track, 3);
+    gfx_SetColor(WHITE);
+    gfx_FillRectangle(px + 5 + pos, y + h - 9, 4, 3);
+
+    gfx_SetTextFGColor(WHITE);
+    print_clipped(m->playing ? "Playing" : "Paused - press Enter/click", px + 6, y + ph - 1, clip_chars_for_width(pw - 12));
+}
+
+static bool click_media(uint8_t id) {
+    if (id < 1 || id > media_count) return false;
+    media_element_t *m = &media[id - 1];
+
+    if (m->type == MEDIA_VIDEO) {
+        m->playing = !m->playing;
+        set_status(m->playing ? "Video playing" : "Video paused");
+    } else {
+        set_status("Image selected");
+    }
+
+    return true;
+}
+
+static void load_offline_test_page(void) {
+    clear_page();
+    show_error = false;
+    error_message[0] = '\0';
+    loading = false;
+
+    save_active_tab();
+
+    links[0][0] = '\0';
+    strcpy(links[0], "https://www.google.com/");
+    strcpy(links[1], "https://www.cemetech.net/");
+    link_count = 2;
+
+    append_text("TEST.COM\n");
+    append_text("Offline browser test page\n\n");
+    append_text("This page is built into GOSSCE, so it works without\n");
+    append_text("the XIAO or an Internet connection.\n\n");
+    append_text("[1] Open Google    [2] Open Cemetech\n\n");
+    append_text("IMAGE TEST\n");
+    append_media_element(MEDIA_IMAGE, "https://test.com/test-image.png", "Built-in image test");
+    append_text("\nVIDEO TEST\n");
+    append_media_element(MEDIA_VIDEO, "https://test.com/test-video.mp4", "Built-in video test");
+    append_text("\n\nMedia protocol also accepts IMAGE <url> and VIDEO <url>.\n");
+    append_text("Current bridge: ");
+    append_text(bridge.open ? "USB connected." : "offline.");
+
+    first_line = 0;
+    selected_link = -1;
+    set_status("Offline test.com");
+    redraw();
+}
+
+static void push_back(const char *u) {
+    if (!u || !u[0]) return;
+
+    if (back_count < MAX_HISTORY) {
+        strncpy(back_stack[back_count], u, sizeof(back_stack[back_count]) - 1);
+        back_stack[back_count][sizeof(back_stack[back_count]) - 1] = '\0';
+        ++back_count;
+    } else {
+        memmove(back_stack, back_stack + 1, sizeof(back_stack) - sizeof(back_stack[0]));
+        strncpy(back_stack[MAX_HISTORY - 1], u, sizeof(back_stack[MAX_HISTORY - 1]) - 1);
+        back_stack[MAX_HISTORY - 1][sizeof(back_stack[MAX_HISTORY - 1]) - 1] = '\0';
+    }
+}
+
+static void push_forward(const char *u) {
+    if (!u || !u[0]) return;
+
+    if (forward_count < MAX_FORWARD) {
+        strncpy(forward_stack[forward_count], u, sizeof(forward_stack[forward_count]) - 1);
+        forward_stack[forward_count][sizeof(forward_stack[forward_count]) - 1] = '\0';
+        ++forward_count;
+    } else {
+        memmove(forward_stack, forward_stack + 1, sizeof(forward_stack) - sizeof(forward_stack[0]));
+        strncpy(forward_stack[MAX_FORWARD - 1], u, sizeof(forward_stack[MAX_FORWARD - 1]) - 1);
+        forward_stack[MAX_FORWARD - 1][sizeof(forward_stack[MAX_FORWARD - 1]) - 1] = '\0';
+    }
+}
+
+static void make_tab_title(uint8_t tab) {
+    const char *p = tabs[tab].url;
+    uint8_t n = 0;
+
+    if (!strncmp(p, "https://", 8))
+        p += 8;
+    else if (!strncmp(p, "http://", 7))
+        p += 7;
+
+    while (*p && *p != '/' && n < sizeof(tabs[tab].title) - 1)
+        tabs[tab].title[n++] = *p++;
+
+    if (!n) {
+        strcpy(tabs[tab].title, "New Tab");
+    } else {
+        tabs[tab].title[n] = '\0';
+    }
+}
+
+static void save_active_tab(void) {
+    strncpy(tabs[active_tab].url, url, sizeof(tabs[active_tab].url) - 1);
+    tabs[active_tab].url[sizeof(tabs[active_tab].url) - 1] = '\0';
+    tabs[active_tab].used = true;
+    make_tab_title(active_tab);
+}
+
+static void reset_tab(uint8_t tab) {
+    tabs[tab].url[0] = '\0';
+    strcpy(tabs[tab].title, "New Tab");
+    tabs[tab].used = false;
+}
+
+static void fetch_url_internal(const char *u, bool add_history, bool clear_forward) {
+    if (!u || !u[0]) return;
+
+    if (add_history && url[0] && strcmp(url, u) != 0) {
+        push_back(url);
+        if (clear_forward)
+            forward_count = 0;
+    }
+
+    strncpy(url, u, sizeof(url) - 1);
+    url[sizeof(url) - 1] = '\0';
+
+    save_active_tab();
+
+    char cmd[300];
+    snprintf(cmd, sizeof(cmd), "GET %s", url);
+
+    clear_page();
+    show_error = false;
+    error_message[0] = '\0';
+
+    if (is_test_url(url)) {
+        load_offline_test_page();
+        return;
+    }
+
+    loading = true;
+    set_status("Connecting...");
+
+    bridge_write_line(cmd);
+}
+
+static void normalize_url_input(const char *input, char *output, size_t capacity) {
+    const char *start = input;
+    size_t len;
+
+    if (!input || !output || capacity < 2) return;
+
+    while (*start == ' ' || *start == '\t') ++start;
+
+    len = strlen(start);
+    while (len > 0 && (start[len - 1] == ' ' || start[len - 1] == '\t'))
+        --len;
+
+    if (!len) {
+        output[0] = '\0';
+        return;
+    }
+
+    if ((len >= 7 && !strncmp(start, "http://", 7)) ||
+        (len >= 8 && !strncmp(start, "https://", 8))) {
+        size_t n = len;
+        if (n >= capacity) n = capacity - 1;
+        memcpy(output, start, n);
+        output[n] = '\0';
+        return;
+    }
+
+    if (len + 8 >= capacity) len = capacity - 9;
+    memcpy(output, "https://", 8);
+    memcpy(output + 8, start, len);
+    output[8 + len] = '\0';
+}
+
+static void fetch_url(const char *u) {
+    fetch_url_internal(u, true, true);
+}
+
+static void go_back(void) {
+    if (!back_count) {
+        set_status("No previous page");
+        return;
+    }
+
+    push_forward(url);
+    --back_count;
+
+    fetch_url_internal(back_stack[back_count], false, false);
+}
+
+static void go_forward(void) {
+    if (!forward_count) {
+        set_status("No next page");
+        return;
+    }
+
+    push_back(url);
+    --forward_count;
+
+    fetch_url_internal(forward_stack[forward_count], false, false);
+}
+
+static void go_home(void) {
+    fetch_url("https://www.google.com/");
+}
+
+static void refresh_page(void) {
+    if (!url[0]) return;
+    fetch_url_internal(url, false, false);
+}
+
+static void stop_loading(void) {
+    loading = false;
+    set_status("Stopped");
+    clear_page();
+    append_text("The connection was stopped.\n\nPress Refresh to try again.");
+    first_line = 0;
+}
+
+static void switch_tab(uint8_t tab) {
+    if (tab >= 5) return;
+    if (tab == active_tab) return;
+
+    save_active_tab();
+    active_tab = tab;
+
+    if (tabs[tab].used && tabs[tab].url[0]) {
+        strncpy(url, tabs[tab].url, sizeof(url) - 1);
+        url[sizeof(url) - 1] = '\0';
+        fetch_url_internal(url, false, false);
+    } else {
+        strcpy(url, "https://www.google.com/");
+        fetch_url_internal(url, false, false);
+        save_active_tab();
+    }
+}
+
+static void new_tab(void) {
+    uint8_t next = (uint8_t)((active_tab + 1) % 5);
+    reset_tab(next);
+    active_tab = next;
+    strcpy(url, "https://www.google.com/");
+    fetch_url_internal(url, false, false);
+    save_active_tab();
+}
+
+static void close_tab(void) {
+    reset_tab(active_tab);
+    uint8_t next = (active_tab == 0) ? 1 : (uint8_t)(active_tab - 1);
+    if (!tabs[next].used) {
+        strcpy(url, "https://www.google.com/");
+        fetch_url_internal(url, false, false);
+        save_active_tab();
+    } else {
+        active_tab = next;
+        strncpy(url, tabs[next].url, sizeof(url) - 1);
+        url[sizeof(url) - 1] = '\0';
+        fetch_url_internal(url, false, false);
+    }
+}
+
+static void add_favorite_current(void) {
+    if (!url[0]) return;
+
+    for (uint8_t i = 0; i < favorite_count; ++i) {
+        if (!strcmp(favorites[i], url)) {
+            set_status("Already in Favorites");
+            return;
+        }
+    }
+
+    if (favorite_count < MAX_FAVORITES) {
+        strncpy(favorites[favorite_count], url, sizeof(favorites[favorite_count]) - 1);
+        favorites[favorite_count][sizeof(favorites[favorite_count]) - 1] = '\0';
+        ++favorite_count;
+        set_status("Added to Favorites");
+    } else {
+        set_status("Favorites full");
+    }
+}
+
+static void redraw(void);
+static void poll_serial(void);
+static int menu_x(uint8_t index);
+static void activate_control(uint8_t control);
+static void draw_sidebar(pane_t pane, int *content_x, int *content_w);
+static void pane_select_open(void);
+static void page_scroll(int direction);
+static void fetch_url(const char *u);
+static void switch_tab(uint8_t index);
+static void open_url_dialog(void);
+static void menu_action(void);
+
+static void add_recent_search(const char *query) {
+    if (!query || !query[0]) return;
+
+    if (recent_search_count < MAX_RECENT_SEARCH) {
+        strncpy(recent_search[recent_search_count], query, sizeof(recent_search[recent_search_count]) - 1);
+        recent_search[recent_search_count][sizeof(recent_search[recent_search_count]) - 1] = '\0';
+        ++recent_search_count;
+    } else {
+        memmove(recent_search, recent_search + 1, sizeof(recent_search) - sizeof(recent_search[0]));
+        strncpy(recent_search[MAX_RECENT_SEARCH - 1], query, sizeof(recent_search[MAX_RECENT_SEARCH - 1]) - 1);
+        recent_search[MAX_RECENT_SEARCH - 1][sizeof(recent_search[MAX_RECENT_SEARCH - 1]) - 1] = '\0';
+    }
+}
+
+static bool custom_text_input(char *buffer, size_t capacity, bool search_mode) {
+    if (!buffer || capacity < 2) return false;
+
+    if (capacity > EDIT_MAX + 1) capacity = EDIT_MAX + 1;
+
+    strncpy(edit_buffer, buffer, EDIT_MAX);
+    edit_buffer[EDIT_MAX] = '\0';
+    edit_length = (uint16_t)strlen(edit_buffer);
+    if (edit_length >= capacity) edit_length = (uint16_t)(capacity - 1);
+    edit_buffer[edit_length] = '\0';
+    edit_cursor = edit_length;
+    edit_alpha_lock = true;
+    edit_symbol_next = false;
+    edit_blink = true;
+
+    edit_replace_all = true;
+
+    dialog_mode = search_mode ? 2 : 1;
+    showing_url_dialog = true;
+    set_status(search_mode ? "Custom search entry" : "Custom URL entry");
+    redraw();
+
+    bool accepted = false;
+    bool done = false;
+    uint16_t ticks = 0;
+
+    while (!done && running) {
+        usb_HandleEvents();
+        poll_serial();
+
+        ++ticks;
+        if ((ticks % 12) == 0) {
+            edit_blink = !edit_blink;
+            redraw();
+        }
+
+        uint8_t key = os_GetCSC();
+        if (!key) continue;
+
+        if (key == KEY_EXIT || key == sk_Clear) {
+            done = true;
+            accepted = false;
+            break;
+        }
+
+        if (key == sk_Enter) {
+            done = true;
+            accepted = true;
+            break;
+        }
+
+        if (key == sk_Left) {
+            edit_replace_all = false;
+            if (edit_cursor) --edit_cursor;
+            edit_blink = true;
+            redraw();
+            continue;
+        }
+
+        if (key == sk_Right) {
+            edit_replace_all = false;
+            if (edit_cursor < edit_length) ++edit_cursor;
+            edit_blink = true;
+            redraw();
+            continue;
+        }
+
+        if (key == sk_Del) {
+            edit_replace_all = false;
+            if (edit_cursor > 0 && edit_length > 0) {
+                memmove(&edit_buffer[edit_cursor - 1],
+                        &edit_buffer[edit_cursor],
+                        edit_length - edit_cursor + 1);
+                --edit_cursor;
+                --edit_length;
+            }
+            edit_blink = true;
+            redraw();
+            continue;
+        }
+
+        if (key == sk_Alpha) {
+            edit_replace_all = false;
+            edit_alpha_lock = !edit_alpha_lock;
+            edit_blink = true;
+            redraw();
+            continue;
+        }
+
+        if (key == sk_2nd && !edit_alpha_lock) {
+            edit_replace_all = false;
+            edit_symbol_next = true;
+            edit_blink = true;
+            redraw();
+            continue;
+        }
+
+        char ch = 0;
+
+        if (key == sk_0) ch = '0';
+        else if (key == sk_1) ch = '1';
+        else if (key == sk_2) ch = '2';
+        else if (key == sk_3) ch = '3';
+        else if (key == sk_4) ch = '4';
+        else if (key == sk_5) ch = '5';
+        else if (key == sk_6) ch = '6';
+        else if (key == sk_7) ch = '7';
+        else if (key == sk_8) ch = '8';
+        else if (key == sk_9) ch = '9';
+        else if (key == sk_DecPnt) ch = '.';
+        else if (key == sk_Div) ch = '/';
+        else if (key == sk_Sub) ch = '-';
+        else if (key == sk_Add) ch = '+';
+        else if (key == sk_Comma) ch = ',';
+        else if (key == sk_LParen) ch = '(';
+        else if (key == sk_RParen) ch = ')';
+        else if (key == sk_Power) ch = '^';
+
+        if (edit_symbol_next) {
+            
+            switch (key) {
+                case sk_0: ch = '?'; break;
+                case sk_1: ch = ':'; break;
+                case sk_2: ch = ';'; break;
+                case sk_3: ch = '&'; break;
+                case sk_4: ch = '%'; break;
+                case sk_5: ch = '#'; break;
+                case sk_6: ch = '_'; break;
+                case sk_7: ch = '~'; break;
+                case sk_8: ch = '='; break;
+                case sk_9: ch = '@'; break;
+                case sk_DecPnt: ch = '_'; break;
+                case sk_Div: ch = ':'; break;
+                case sk_Sub: ch = '_'; break;
+                case sk_Add: ch = '='; break;
+                case sk_Mul: ch = '*'; break;
+                default: break;
+            }
+            edit_symbol_next = false;
+        }
+
+        if (!ch && edit_alpha_lock) {
+            switch (key) {
+                case 50: ch = 'A'; break;
+                case 44: ch = 'B'; break;
+                case 45: ch = 'C'; break;
+                case 182: ch = 'D'; break;
+                case 183: ch = 'E'; break;
+                case 185: ch = 'F'; break;
+                case 187: ch = 'G'; break;
+                case 132: ch = 'H'; break;
+                case 189: ch = 'I'; break;
+                case 139: ch = 'J'; break;
+                case 133: ch = 'K'; break;
+                case 134: ch = 'L'; break;
+                case 131: ch = 'M'; break;
+                case 193: ch = 'N'; break;
+                case 149: ch = 'O'; break;
+                case 150: ch = 'P'; break;
+                case 151: ch = 'Q'; break;
+                case 130: ch = 'R'; break;
+                case 191: ch = 'S'; break;
+                case 146: ch = 'T'; break;
+                case 147: ch = 'U'; break;
+                case 148: ch = 'V'; break;
+                case 129: ch = 'W'; break;
+                case 138: ch = 'X'; break;
+                case 143: ch = 'Y'; break;
+                case 144: ch = 'Z'; break;
+                default: break;
+            }
+        }
+
+        if (ch && edit_length < capacity) {
+            
+            if (edit_replace_all) {
+                edit_buffer[0] = '\0';
+                edit_length = 0;
+                edit_cursor = 0;
+                edit_replace_all = false;
+            }
+
+            if (edit_length < capacity - 1) {
+                memmove(&edit_buffer[edit_cursor + 1],
+                        &edit_buffer[edit_cursor],
+                        edit_length - edit_cursor + 1);
+                edit_buffer[edit_cursor] = ch;
+                ++edit_cursor;
+                ++edit_length;
+                edit_blink = true;
+
+                gfx_SetDrawBuffer();
+                redraw();
+            }
+        }
+    }
+
+    showing_url_dialog = false;
+    dialog_mode = 0;
+    edit_blink = false;
+    edit_replace_all = false;
+
+    if (accepted) {
+        strncpy(buffer, edit_buffer, capacity - 1);
+        buffer[capacity - 1] = '\0';
+    }
+
+    redraw();
+    return accepted;
+}
+
+static void search_web(void) {
+    char query[80] = "";
+
+    if (!custom_text_input(query, sizeof(query), true))
+        return;
+
+    if (!query[0]) {
+        redraw();
+        return;
+    }
+
+    add_recent_search(query);
+
+    char encoded[120];
+    uint16_t j = 0;
+
+    for (uint16_t i = 0; query[i] && j < sizeof(encoded) - 1; ++i) {
+        char c = query[i];
+        if (c == ' ') c = '+';
+        encoded[j++] = c;
+    }
+
+    encoded[j] = '\0';
+
+    char search_url[240];
+    snprintf(search_url, sizeof(search_url), "https://www.google.com/search?q=%s", encoded);
+    fetch_url(search_url);
+}
+
+static void print_clipped(const char *text, int x, int y, uint8_t max_chars) {
+    char buf[64];
+    size_t n;
+
+    if (max_chars >= sizeof(buf))
+        max_chars = sizeof(buf) - 1;
+
+    n = strlen(text);
+    if (n <= max_chars) {
+        gfx_PrintStringXY(text, x, y);
+        return;
+    }
+
+    if (max_chars < 4) {
+        memcpy(buf, text, max_chars);
+        buf[max_chars] = '\0';
+    } else {
+        memcpy(buf, text, max_chars);
+        buf[max_chars - 3] = '.';
+        buf[max_chars - 2] = '.';
+        buf[max_chars - 1] = '.';
+        buf[max_chars] = '\0';
+    }
+
+    gfx_PrintStringXY(buf, x, y);
+}
+
+static uint8_t clip_chars_for_width(int pixels) {
+    if (pixels <= 0) return 1;
+    int n = pixels / 7;
+    if (n < 1) n = 1;
+    if (n > 63) n = 63;
+    return (uint8_t)n;
+}
+
+static void draw_3d_button(int x, int y, int w, int h, bool focused, bool pressed, bool enabled) {
+    uint8_t fill = enabled ? MID : DARK;
+    uint8_t hi = enabled ? LIGHT : MID;
+    uint8_t lo = SHADOW;
+
+    gfx_SetColor(fill);
+    gfx_FillRectangle(x, y, w, h);
+
+    if (pressed) {
+        gfx_SetColor(lo);
+        gfx_Line(x, y, x + w - 1, y);
+        gfx_Line(x, y, x, y + h - 1);
+        gfx_SetColor(hi);
+        gfx_Line(x, y + h - 1, x + w - 1, y + h - 1);
+        gfx_Line(x + w - 1, y, x + w - 1, y + h - 1);
+    } else {
+        gfx_SetColor(hi);
+        gfx_Line(x, y, x + w - 1, y);
+        gfx_Line(x, y, x, y + h - 1);
+        gfx_SetColor(lo);
+        gfx_Line(x, y + h - 1, x + w - 1, y + h - 1);
+        gfx_Line(x + w - 1, y, x + w - 1, y + h - 1);
+    }
+
+    if (focused) {
+        gfx_SetColor(BLACK);
+        gfx_Rectangle(x + 2, y + 2, w - 5, h - 5);
+    }
+}
+
+static void draw_logo_globe(int x, int y, int r) {
+    gfx_SetColor(BLUE);
+    gfx_Circle(x, y, r);
+    gfx_SetColor(WHITE);
+    gfx_Circle(x, y, r - 1);
+    gfx_SetColor(BLUE);
+    gfx_Line(x - r + 2, y, x + r - 2, y);
+    gfx_Line(x, y - r + 2, x, y + r - 2);
+    gfx_Line(x - r / 2, y - r + 1, x + r / 2, y + r - 1);
+    gfx_Line(x + r / 2, y - r + 1, x - r / 2, y + r - 1);
+}
+
+static void draw_logo_ie(int x, int y, int scale) {
+    int r = 5 * scale;
+    draw_logo_globe(x, y, r);
+    gfx_SetTextFGColor(BLUE);
+    gfx_PrintStringXY("e", x - 4 * scale, y - 4 * scale);
+}
+
+static void draw_logo_document(int x, int y) {
+    gfx_SetColor(WHITE);
+    gfx_FillRectangle(x + 2, y + 1, 11, 14);
+    gfx_SetColor(BLUE);
+    gfx_Rectangle(x + 2, y + 1, 11, 14);
+    gfx_Line(x + 9, y + 1, x + 13, y + 5);
+    gfx_Line(x + 9, y + 1, x + 9, y + 5);
+    gfx_Line(x + 9, y + 5, x + 13, y + 5);
+    gfx_SetColor(SHADOW);
+    gfx_Line(x + 4, y + 9, x + 11, y + 9);
+    gfx_Line(x + 4, y + 11, x + 10, y + 11);
+}
+
+static void draw_logo_folder(int x, int y) {
+    gfx_SetColor(0x0F);
+    gfx_FillRectangle(x + 1, y + 4, 15, 10);
+    gfx_FillRectangle(x + 3, y + 2, 7, 3);
+    gfx_SetColor(SHADOW);
+    gfx_Rectangle(x + 1, y + 4, 15, 10);
+    gfx_SetColor(WHITE);
+    gfx_Line(x + 3, y + 5, x + 14, y + 5);
+}
+
+static void draw_logo_history(int x, int y) {
+    gfx_SetColor(WHITE);
+    gfx_Circle(x + 8, y + 8, 7);
+    gfx_SetColor(BLUE);
+    gfx_Circle(x + 8, y + 8, 6);
+    gfx_SetColor(WHITE);
+    gfx_Line(x + 8, y + 8, x + 8, y + 4);
+    gfx_Line(x + 8, y + 8, x + 11, y + 10);
+    gfx_Line(x + 2, y + 3, x + 4, y + 1);
+    gfx_Line(x + 2, y + 3, x + 2, y + 6);
+}
+
+static void draw_logo_search(int x, int y) {
+    gfx_SetColor(WHITE);
+    gfx_Circle(x + 6, y + 6, 5);
+    gfx_SetColor(BLUE);
+    gfx_Circle(x + 6, y + 6, 4);
+    gfx_Line(x + 10, y + 10, x + 15, y + 15);
+}
+
+static void draw_logo_link(int x, int y) {
+    gfx_SetColor(BLUE);
+    gfx_Rectangle(x + 1, y + 5, 7, 5);
+    gfx_Rectangle(x + 8, y + 5, 7, 5);
+    gfx_SetColor(WHITE);
+    gfx_Line(x + 6, y + 7, x + 10, y + 7);
+}
+
+static void draw_logo_star(int x, int y) {
+    gfx_SetColor(0x0E);
+    gfx_Line(x + 8, y + 1, x + 10, y + 6);
+    gfx_Line(x + 10, y + 6, x + 15, y + 6);
+    gfx_Line(x + 15, y + 6, x + 11, y + 9);
+    gfx_Line(x + 11, y + 9, x + 13, y + 14);
+    gfx_Line(x + 13, y + 14, x + 8, y + 11);
+    gfx_Line(x + 8, y + 11, x + 3, y + 14);
+    gfx_Line(x + 3, y + 14, x + 5, y + 9);
+    gfx_Line(x + 5, y + 9, x + 1, y + 6);
+    gfx_Line(x + 1, y + 6, x + 6, y + 6);
+    gfx_Line(x + 6, y + 6, x + 8, y + 1);
+}
+
+static void draw_logo_chip(int x, int y) {
+    gfx_SetColor(BLUE);
+    gfx_FillRectangle(x + 3, y + 3, 10, 10);
+    gfx_SetColor(WHITE);
+    gfx_Rectangle(x + 5, y + 5, 6, 6);
+    gfx_SetColor(BLUE);
+    gfx_Line(x + 1, y + 5, x + 3, y + 5);
+    gfx_Line(x + 1, y + 9, x + 3, y + 9);
+    gfx_Line(x + 13, y + 5, x + 15, y + 5);
+    gfx_Line(x + 13, y + 9, x + 15, y + 9);
+    gfx_Line(x + 5, y + 1, x + 5, y + 3);
+    gfx_Line(x + 9, y + 1, x + 9, y + 3);
+    gfx_Line(x + 5, y + 13, x + 5, y + 15);
+    gfx_Line(x + 9, y + 13, x + 9, y + 15);
+}
+
+static void draw_status_chip(int x, int y, bool connected) {
+    gfx_SetColor(connected ? BLUE : SHADOW);
+    gfx_FillRectangle(x + 2, y + 2, 9, 9);
+    gfx_SetColor(WHITE);
+    gfx_Rectangle(x + 4, y + 4, 5, 5);
+    gfx_SetColor(connected ? BLUE : DARK);
+    gfx_Line(x + 1, y + 4, x + 2, y + 4);
+    gfx_Line(x + 1, y + 8, x + 2, y + 8);
+    gfx_Line(x + 11, y + 4, x + 12, y + 4);
+    gfx_Line(x + 11, y + 8, x + 12, y + 8);
+}
+
+static void draw_logo_warning(int x, int y) {
+    gfx_SetColor(0x0E);
+    gfx_Line(x + 8, y + 1, x + 15, y + 14);
+    gfx_Line(x + 15, y + 14, x + 1, y + 14);
+    gfx_Line(x + 1, y + 14, x + 8, y + 1);
+    gfx_SetTextFGColor(BLACK);
+    gfx_PrintStringXY("!", x + 6, y + 4);
+}
+
+static void draw_logo_window(int x, int y) {
+    gfx_SetColor(WHITE);
+    gfx_FillRectangle(x + 1, y + 1, 14, 14);
+    gfx_SetColor(BLUE);
+    gfx_Rectangle(x + 1, y + 1, 14, 14);
+    gfx_FillRectangle(x + 3, y + 3, 10, 3);
+    gfx_SetColor(SHADOW);
+    gfx_Line(x + 3, y + 8, x + 13, y + 8);
+    gfx_Line(x + 3, y + 10, x + 13, y + 10);
+}
+
+static void draw_icon_back(int x, int y) {
+    gfx_SetColor(BLUE);
+    gfx_Line(x + 10, y + 2, x + 3, y + 8);
+    gfx_Line(x + 3, y + 8, x + 10, y + 14);
+    gfx_Line(x + 4, y + 8, x + 15, y + 8);
+    gfx_SetColor(DARK);
+    gfx_Line(x + 10, y + 5, x + 14, y + 8);
+    gfx_Line(x + 10, y + 11, x + 14, y + 8);
+}
+
+static void draw_icon_forward(int x, int y) {
+    gfx_SetColor(BLUE);
+    gfx_Line(x + 5, y + 2, x + 12, y + 8);
+    gfx_Line(x + 12, y + 8, x + 5, y + 14);
+    gfx_Line(x + 11, y + 8, x, y + 8);
+    gfx_SetColor(DARK);
+    gfx_Line(x + 5, y + 5, x + 1, y + 8);
+    gfx_Line(x + 5, y + 11, x + 1, y + 8);
+}
+
+static void draw_icon_stop(int x, int y) {
+    gfx_SetColor(0x09);
+    gfx_FillRectangle(x + 3, y + 3, 10, 10);
+    gfx_SetColor(DARK);
+    gfx_Rectangle(x + 3, y + 3, 10, 10);
+}
+
+static void draw_icon_refresh(int x, int y) {
+    gfx_SetColor(BLUE);
+    gfx_Circle(x + 8, y + 8, 6);
+    gfx_SetColor(MID);
+    gfx_FillRectangle(x + 7, y + 1, 8, 7);
+    gfx_SetColor(BLUE);
+    gfx_Line(x + 11, y + 2, x + 15, y + 5);
+    gfx_Line(x + 15, y + 5, x + 11, y + 6);
+}
+
+static void draw_icon_home(int x, int y) {
+    gfx_SetColor(BLUE);
+    gfx_Line(x + 2, y + 8, x + 8, y + 2);
+    gfx_Line(x + 8, y + 2, x + 15, y + 8);
+    gfx_Line(x + 4, y + 7, x + 4, y + 14);
+    gfx_Line(x + 4, y + 14, x + 13, y + 14);
+    gfx_Line(x + 13, y + 14, x + 13, y + 7);
+    gfx_SetColor(DARK);
+    gfx_Rectangle(x + 6, y + 9, 3, 5);
+}
+
+static void draw_icon_star(int x, int y) {
+    gfx_SetColor(0x0E);
+    gfx_Line(x + 8, y + 1, x + 10, y + 6);
+    gfx_Line(x + 10, y + 6, x + 15, y + 6);
+    gfx_Line(x + 15, y + 6, x + 11, y + 9);
+    gfx_Line(x + 11, y + 9, x + 13, y + 14);
+    gfx_Line(x + 13, y + 14, x + 8, y + 11);
+    gfx_Line(x + 8, y + 11, x + 3, y + 14);
+    gfx_Line(x + 3, y + 14, x + 5, y + 9);
+    gfx_Line(x + 5, y + 9, x + 1, y + 6);
+    gfx_Line(x + 1, y + 6, x + 6, y + 6);
+    gfx_Line(x + 6, y + 6, x + 8, y + 1);
+}
+
+static void draw_icon_search(int x, int y) {
+    gfx_SetColor(BLUE);
+    gfx_Circle(x + 6, y + 6, 5);
+    gfx_Line(x + 10, y + 10, x + 15, y + 15);
+    gfx_SetColor(LIGHT);
+    gfx_Line(x + 4, y + 3, x + 7, y + 2);
+}
+
+static void draw_icon_help(int x, int y) {
+    gfx_SetColor(BLUE);
+    gfx_Circle(x + 8, y + 8, 7);
+    gfx_SetTextFGColor(WHITE);
+    gfx_PrintStringXY("?", x + 6, y + 3);
+}
+
+static void draw_toolbar_label(int x, int y, const char *label) {
+    gfx_SetTextFGColor(BLACK);
+    gfx_PrintStringXY(label, x, y);
+}
+
+static void draw_toolbar_button(int x, int y, int w, const char *icon, const char *label) {
+    draw_3d_button(x, y, w, 31, false, false, true);
+
+    if (icon && icon[0]) {
+        gfx_SetTextFGColor(BLUE);
+        gfx_PrintStringXY(icon, x + 8, y + 4);
+    }
+
+    if (label && label[0]) {
+        gfx_SetTextFGColor(BLACK);
+        gfx_PrintStringXY(label, x + 8, y + 17);
+    }
+}
+
+static void draw_titlebar(void) {
+    gfx_SetColor(BLUE);
+    gfx_FillRectangle(0, 0, 320, TITLE_H);
+
+    gfx_SetColor(WHITE);
+    gfx_FillRectangle(2, 2, 12, 12);
+    draw_logo_ie(8, 8, 1);
+
+    gfx_SetTextFGColor(WHITE);
+    gfx_PrintStringXY("Microsoft Internet Explorer", 18, 4);
+
+    draw_3d_button(286, 2, 9, 13, false, false, true);
+    draw_3d_button(297, 2, 9, 13, false, false, true);
+    draw_3d_button(308, 2, 10, 13, false, false, true);
+
+    gfx_SetTextFGColor(BLACK);
+    gfx_PrintStringXY("_", 288, 1);
+    gfx_PrintStringXY("[]", 298, 0);
+    gfx_PrintStringXY("X", 310, 1);
+}
+
+static int menu_x(uint8_t index) {
+    static const int x[] = {4, 31, 59, 88, 112, 174, 211};
+    return x[index];
+}
+
+static void draw_menubar(void) {
+    gfx_SetColor(MID);
+    gfx_FillRectangle(0, TITLE_H, 320, MENU_H);
+    gfx_SetColor(SHADOW);
+    gfx_Line(0, TITLE_H + MENU_H - 1, 319, TITLE_H + MENU_H - 1);
+
+    for (uint8_t i = 0; i < 7; ++i) {
+        bool selected = menu_open && i == menu_index;
+
+        if (selected) {
+            static const uint8_t mw[7] = {28, 30, 30, 26, 62, 37, 37};
+            gfx_SetColor(BLUE);
+            gfx_FillRectangle(menu_x(i) - 2, TITLE_H + 1, mw[i], MENU_H - 2);
+            gfx_SetTextFGColor(WHITE);
+        } else {
+            gfx_SetTextFGColor(BLACK);
+        }
+
+        gfx_PrintStringXY(menu_names[i], menu_x(i), TITLE_H + 3);
+    }
+}
+
+static void draw_toolbar(void) {
+    int y = TITLE_H + MENU_H;
+    gfx_SetColor(MID);
+    gfx_FillRectangle(0, y, 320, TOOL_H);
+
+    const char *labels[8] = {
+        "Back", "Fwd", "Stop", "Ref",
+        "Home", "Fav", "Srch", "Help"
+    };
+
+    int widths[8] = {38, 38, 38, 38, 38, 38, 38, 38};
+    int xpos = 2;
+
+    for (uint8_t i = 0; i < 8; ++i) {
+        bool enabled = true;
+        if (i == 0 && !back_count) enabled = false;
+        if (i == 1 && !forward_count) enabled = false;
+
+        draw_3d_button(
+            xpos,
+            y + 2,
+            widths[i],
+            TOOL_H - 5,
+            focus_control == i,
+            pressed_control == i && pressed_frames,
+            enabled
+        );
+
+        int ix = xpos + 11;
+        int iy = y + 2;
+
+        switch (i) {
+            case 0: draw_icon_back(ix, iy); break;
+            case 1: draw_icon_forward(ix, iy); break;
+            case 2: draw_icon_stop(ix, iy); break;
+            case 3: draw_icon_refresh(ix, iy); break;
+            case 4: draw_icon_home(ix, iy); break;
+            case 5: draw_icon_star(ix, iy); break;
+            case 6: draw_icon_search(ix, iy); break;
+            case 7: draw_icon_help(ix, iy); break;
+        }
+
+        draw_toolbar_label(xpos + 3, y + 18, labels[i]);
+        xpos += widths[i] + 2;
+    }
+
+    gfx_SetColor(SHADOW);
+    gfx_Line(0, y + TOOL_H - 1, 319, y + TOOL_H - 1);
+}
+
+static void draw_address_bar(void) {
+    int y = TITLE_H + MENU_H + TOOL_H;
+
+    gfx_SetColor(MID);
+    gfx_FillRectangle(0, y, 320, URL_H);
+
+    gfx_SetTextFGColor(BLACK);
+    gfx_PrintStringXY("Address", 4, y + 6);
+
+    draw_3d_button(45, y + 2, 252, 16, focus_control == 8, false, true);
+
+    gfx_SetColor(WHITE);
+    gfx_FillRectangle(47, y + 4, 248, 12);
+
+    gfx_SetTextFGColor(BLACK);
+    print_clipped(url, 50, y + 6, clip_chars_for_width(240));
+
+    if (focus_control == 8) {
+        gfx_SetColor(BLACK);
+        gfx_Rectangle(46, y + 3, 250, 14);
+    }
+
+    draw_3d_button(299, y + 2, 18, 16, focus_control == 9, false, true);
+    gfx_SetTextFGColor(BLACK);
+    gfx_PrintStringXY("Go", 302, y + 6);
+
+    gfx_SetColor(SHADOW);
+    gfx_Line(0, y + URL_H - 1, 319, y + URL_H - 1);
+}
+
+static void draw_tabs(void) {
+    int y = TITLE_H + MENU_H + TOOL_H + URL_H;
+    gfx_SetColor(MID);
+    gfx_FillRectangle(0, y, 320, TAB_H);
+
+    for (uint8_t i = 0; i < 5; ++i) {
+        int x = i * 64;
+        bool active = i == active_tab;
+        bool focused = focus_control == (10 + i);
+
+        draw_3d_button(x + 1, y + 1, 62, 14, false, false, true);
+
+        if (active) {
+            gfx_SetColor(WHITE);
+            gfx_FillRectangle(x + 3, y + 3, 58, 9);
+        }
+
+        if (i == active_tab) {
+            draw_logo_ie(x + 8, y + 8, 1);
+        } else if (tabs[i].used) {
+            draw_logo_document(x + 2, y + 2);
+        } else {
+            draw_logo_window(x + 2, y + 2);
+        }
+
+        gfx_SetTextFGColor(BLACK);
+        print_clipped(tabs[i].used ? tabs[i].title : "New Tab", x + 18, y + 4, 6);
+
+        if (focused) {
+            gfx_SetColor(BLACK);
+            gfx_Rectangle(x + 2, y + 2, 59, 11);
+        }
+    }
+
+    gfx_SetColor(SHADOW);
+    gfx_Line(0, y + TAB_H - 1, 319, y + TAB_H - 1);
+}
+
+static void draw_loading_page(int x, int w) {
+    gfx_SetTextFGColor(BLACK);
+    gfx_PrintStringXY("Internet Explorer", x + 8, CONTENT_Y + 12);
+    gfx_PrintStringXY("Connecting to:", x + 8, CONTENT_Y + 30);
+    print_clipped(url, x + 8, CONTENT_Y + 44, clip_chars_for_width(w - 16));
+
+    draw_logo_ie(x + w / 2, CONTENT_Y + 82, 2);
+
+    uint8_t dots = (uint8_t)((rx_len + first_line) % 4);
+    char msg[24] = "Please wait";
+    for (uint8_t i = 0; i < dots; ++i)
+        strcat(msg, ".");
+    gfx_SetTextFGColor(BLACK);
+    gfx_PrintStringXY(msg, x + 8, CONTENT_Y + 105);
+}
+
+static void draw_error_page(int x) {
+    gfx_SetTextFGColor(BLACK);
+    gfx_PrintStringXY("The page cannot be displayed", x + 8, CONTENT_Y + 12);
+    gfx_PrintStringXY("because the browser could not", x + 8, CONTENT_Y + 28);
+    gfx_PrintStringXY("complete the request.", x + 8, CONTENT_Y + 38);
+
+    draw_logo_warning(x + 22, CONTENT_Y + 66);
+
+    gfx_PrintStringXY("Address:", x + 42, CONTENT_Y + 57);
+    print_clipped(url, x + 42, CONTENT_Y + 69, clip_chars_for_width(205));
+
+    gfx_SetTextFGColor(BLACK);
+    gfx_PrintStringXY("Details:", x + 8, CONTENT_Y + 91);
+    print_clipped(error_message[0] ? error_message : "Unknown bridge error", x + 8, CONTENT_Y + 103, clip_chars_for_width(205));
+}
+
+static void draw_linked_line(const char *line, int x, int y, int max_x) {
+    const char *p = line;
+    int px = x;
+
+    while (*p && px < max_x) {
+        if (*p == '[' && p[1] >= '1' && p[1] <= '9' && p[2] == ']') {
+            uint8_t n = (uint8_t)(p[1] - '0');
+            const char *next = p + 3;
+            int width = 18;
+
+            if (px + width > max_x)
+                break;
+
+            if (n == selected_link) {
+                gfx_SetColor(BLUE);
+                gfx_FillRectangle(px - 1, y - 1, width, 9);
+                gfx_SetTextFGColor(WHITE);
+            } else {
+                gfx_SetTextFGColor(LINK_BLUE);
+            }
+
+            gfx_PrintStringXY((n == 1) ? "[1]" :
+                              (n == 2) ? "[2]" :
+                              (n == 3) ? "[3]" :
+                              (n == 4) ? "[4]" :
+                              (n == 5) ? "[5]" :
+                              (n == 6) ? "[6]" :
+                              (n == 7) ? "[7]" :
+                              (n == 8) ? "[8]" : "[9]", px, y);
+
+            gfx_SetColor(n == selected_link ? WHITE : LINK_BLUE);
+            gfx_Line(px, y + 8, px + width - 2, y + 8);
+
+            px += width;
+            p = next;
+        } else {
+            if (px + 7 > max_x)
+                break;
+            char one[2] = {*p, '\0'};
+            gfx_SetTextFGColor(BLACK);
+            gfx_PrintStringXY(one, px, y);
+            px += 7;
+            ++p;
+        }
+    }
+}
+
+static void draw_scrollbar(int x, int y, int h) {
+    draw_3d_button(x, y, SCROLL_W, h, false, false, true);
+
+    gfx_SetTextFGColor(BLACK);
+    gfx_PrintStringXY("^", x + 4, y + 1);
+    gfx_PrintStringXY("v", x + 4, y + h - 11);
+
+    if (line_count <= VISIBLE_LINES) return;
+
+    int track = h - 28;
+    int thumb_h = track * VISIBLE_LINES / line_count;
+    if (thumb_h < 13) thumb_h = 13;
+
+    int max_offset = line_count - VISIBLE_LINES;
+    int free_track = track - thumb_h;
+    int ty = y + 14;
+    if (free_track > 0 && max_offset > 0)
+        ty += free_track * first_line / max_offset;
+
+    draw_3d_button(x + 2, ty, SCROLL_W - 4, thumb_h, focus_control == 15, false, true);
+}
+
+static void draw_sidebar(pane_t pane, int *content_x, int *content_w) {
+    if (pane == PANE_NONE) {
+        *content_x = 2;
+        *content_w = 316;
+        return;
+    }
+
+    int pane_w = 88;
+    *content_x = pane_w + 2;
+    *content_w = 316 - pane_w;
+
+    gfx_SetColor(MID);
+    gfx_FillRectangle(2, CONTENT_Y, pane_w - 2, CONTENT_H);
+    gfx_SetColor(SHADOW);
+    gfx_Rectangle(2, CONTENT_Y, pane_w - 2, CONTENT_H);
+
+    gfx_SetColor(BLUE);
+    gfx_FillRectangle(4, CONTENT_Y + 2, pane_w - 6, 14);
+    gfx_SetTextFGColor(WHITE);
+
+    if (pane == PANE_FAVORITES) {
+        draw_logo_star(6, CONTENT_Y + 1);
+        gfx_PrintStringXY("Favorites", 20, CONTENT_Y + 5);
+    } else if (pane == PANE_HISTORY) {
+        draw_logo_history(6, CONTENT_Y + 1);
+        gfx_PrintStringXY("History", 20, CONTENT_Y + 5);
+    } else {
+        draw_logo_search(6, CONTENT_Y + 1);
+        gfx_PrintStringXY("Search", 20, CONTENT_Y + 5);
+    }
+
+    gfx_SetTextFGColor(BLACK);
+
+    if (pane == PANE_FAVORITES) {
+        for (uint8_t i = 0; i < favorite_count && i < 8; ++i) {
+            int iy = CONTENT_Y + 22 + i * 12;
+            if (pane_selection == i) {
+                gfx_SetColor(BLUE);
+                gfx_FillRectangle(5, iy - 1, pane_w - 8, 11);
+                gfx_SetTextFGColor(WHITE);
+            } else {
+                gfx_SetTextFGColor(BLACK);
+            }
+            char item[14];
+            snprintf(item, sizeof(item), "%d. %s", i + 1, favorites[i]);
+            item[13] = '\0';
+            print_clipped(item, 7, iy, 11);
+        }
+        gfx_SetTextFGColor(BLACK);
+        gfx_PrintStringXY("Enter: open", 7, CONTENT_Y + 108);
+    } else if (pane == PANE_HISTORY) {
+        for (uint8_t i = 0; i < back_count && i < 8; ++i) {
+            int iy = CONTENT_Y + 22 + i * 12;
+            if (pane_selection == i) {
+                gfx_SetColor(BLUE);
+                gfx_FillRectangle(5, iy - 1, pane_w - 8, 11);
+                gfx_SetTextFGColor(WHITE);
+            } else {
+                gfx_SetTextFGColor(BLACK);
+            }
+            char item[14];
+            snprintf(item, sizeof(item), "%d. %s", i + 1, back_stack[back_count - 1 - i]);
+            item[13] = '\0';
+            print_clipped(item, 7, iy, 11);
+        }
+        gfx_SetTextFGColor(BLACK);
+        gfx_PrintStringXY("Enter: open", 7, CONTENT_Y + 108);
+    } else {
+        if (pane_selection == 0) {
+            gfx_SetColor(BLUE);
+            gfx_FillRectangle(5, CONTENT_Y + 22, pane_w - 8, 11);
+            gfx_SetTextFGColor(WHITE);
+        } else {
+            gfx_SetTextFGColor(BLACK);
+        }
+        gfx_PrintStringXY("New search", 7, CONTENT_Y + 24);
+        gfx_SetTextFGColor(BLACK);
+        gfx_PrintStringXY("Recent:", 7, CONTENT_Y + 39);
+        for (uint8_t i = 0; i < recent_search_count && i < 6; ++i) {
+            int iy = CONTENT_Y + 51 + i * 11;
+            if (pane_selection == i + 1) {
+                gfx_SetColor(BLUE);
+                gfx_FillRectangle(5, iy - 1, pane_w - 8, 10);
+                gfx_SetTextFGColor(WHITE);
+            } else {
+                gfx_SetTextFGColor(BLACK);
+            }
+            char item[14];
+            snprintf(item, sizeof(item), "%d. %s", i + 1, recent_search[i]);
+            item[13] = '\0';
+            print_clipped(item, 7, iy, 11);
+        }
+    }
+}
+
+static void draw_document(void) {
+    int x, w;
+    draw_sidebar(active_pane, &x, &w);
+
+    if (!loading && !show_error)
+        wrap_page();
+
+    int doc_y = CONTENT_Y;
+    int doc_h = CONTENT_H;
+    int text_x = x + 5;
+    int scroll_x = x + w - SCROLL_W;
+    int text_w = w - SCROLL_W - 6;
+
+    gfx_SetColor(WHITE);
+    gfx_FillRectangle(x, doc_y, text_w, doc_h);
+    gfx_SetColor(SHADOW);
+    gfx_Rectangle(x, doc_y, text_w, doc_h);
+
+    if (loading) {
+        draw_loading_page(x, text_w);
+        draw_scrollbar(scroll_x, doc_y, doc_h);
+        return;
+    }
+
+    if (show_error) {
+        draw_error_page(x);
+        draw_scrollbar(scroll_x, doc_y, doc_h);
+        return;
+    }
+
+    int doc_bottom = doc_y + doc_h - 2;
+
+    for (uint16_t row = 0; row < VISIBLE_LINES; ++row) {
+        uint16_t idx = first_line + row;
+        if (idx >= line_count) break;
+
+        int y = doc_y + 7 + row * LINE_H;
+        int mid = media_token(lines[idx]);
+        if (mid > 0 && mid <= media_count) {
+            if (media[mid - 1].type == MEDIA_IMAGE)
+                draw_media_image(&media[mid - 1], text_x, y, x + text_w - 3, doc_bottom);
+            else
+                draw_media_video(&media[mid - 1], text_x, y, x + text_w - 3, doc_bottom);
+        } else {
+            draw_linked_line(lines[idx], text_x, y, x + text_w - 3);
+        }
+    }
+
+    draw_scrollbar(scroll_x, doc_y, doc_h);
+}
+
+static void draw_statusbar(void) {
+    gfx_SetColor(MID);
+    gfx_FillRectangle(0, STATUS_Y, 320, STATUS_H);
+
+    gfx_SetColor(SHADOW);
+    gfx_Line(0, STATUS_Y, 319, STATUS_Y);
+
+    gfx_SetTextFGColor(BLACK);
+
+    if (loading) {
+        print_clipped("Connecting...", 5, STATUS_Y + 4, 33);
+    } else if (status_text[0]) {
+        print_clipped(status_text, 5, STATUS_Y + 4, 33);
+    } else if (show_error) {
+        gfx_PrintStringXY("Error", 5, STATUS_Y + 4);
+    } else {
+        gfx_PrintStringXY("Done", 5, STATUS_Y + 4);
+    }
+
+    gfx_SetColor(SHADOW);
+    gfx_Line(248, STATUS_Y + 2, 248, STATUS_Y + STATUS_H - 2);
+    draw_status_chip(252, STATUS_Y + 2, bridge.open);
+    gfx_SetTextFGColor(BLACK);
+    gfx_PrintStringXY(bridge.open ? "USB OK" : "USB OFF", 269, STATUS_Y + 4);
+}
+
+static void draw_dropdown(void) {
+    if (!menu_open) return;
+
+    int x = menu_x(menu_index) - 2;
+    int y = TITLE_H + MENU_H;
+    int w = (menu_index == 4) ? 130 : 124;
+    uint8_t count = menu_count(menu_index);
+    int h = count * 14 + 6;
+
+    if (x + w > 319) x = 319 - w;
+
+    gfx_SetColor(MID);
+    gfx_FillRectangle(x, y, w, h);
+    gfx_SetColor(LIGHT);
+    gfx_Line(x, y, x + w - 1, y);
+    gfx_Line(x, y, x, y + h - 1);
+    gfx_SetColor(SHADOW);
+    gfx_Line(x, y + h - 1, x + w - 1, y + h - 1);
+    gfx_Line(x + w - 1, y, x + w - 1, y + h - 1);
+
+    const char **items = menu_list(menu_index);
+    for (uint8_t i = 0; i < count; ++i) {
+        int iy = y + 3 + i * 14;
+        if (i == menu_item) {
+            gfx_SetColor(BLUE);
+            gfx_FillRectangle(x + 2, iy, w - 4, 12);
+            gfx_SetTextFGColor(WHITE);
+        } else {
+            gfx_SetTextFGColor(BLACK);
+        }
+        gfx_PrintStringXY(items[i], x + 6, iy + 2);
+    }
+}
+
+static void draw_url_dialog(void) {
+    int x = 28;
+    int y = 53;
+    int w = 264;
+    int h = 132;
+    const char *title = dialog_mode == 2 ? "Internet Explorer - Search" : "Internet Explorer";
+
+    draw_document();
+    draw_3d_button(x, y, w, h, false, false, true);
+
+    gfx_SetColor(BLUE);
+    gfx_FillRectangle(x + 2, y + 2, w - 4, 16);
+    gfx_SetTextFGColor(WHITE);
+    gfx_PrintStringXY(title, x + 7, y + 6);
+
+    gfx_SetTextFGColor(BLACK);
+    gfx_PrintStringXY(dialog_mode == 2 ? "Search the Web" : "Open URL", x + 10, y + 28);
+
+    gfx_SetColor(WHITE);
+    gfx_FillRectangle(x + 10, y + 40, w - 20, 24);
+    gfx_SetColor(SHADOW);
+    gfx_Rectangle(x + 10, y + 40, w - 20, 24);
+
+    const int field_x = x + 14;
+    const int field_w = w - 28;
+    const uint8_t max_chars = clip_chars_for_width(field_w - 6);
+    uint16_t first = 0;
+    if (edit_length > max_chars && edit_cursor > max_chars)
+        first = edit_cursor - max_chars;
+
+    char shown[80];
+    uint16_t n = 0;
+    for (uint16_t i = first; i < edit_length && n < sizeof(shown) - 1; ++i)
+        shown[n++] = edit_buffer[i];
+    shown[n] = '\0';
+
+    gfx_SetTextFGColor(BLACK);
+    gfx_PrintStringXY(shown, field_x, y + 47);
+
+    int cursor_px = field_x + (edit_cursor - first) * 7;
+    if ((cursor_px < field_x + field_w - 2) && edit_blink) {
+        gfx_SetColor(BLUE);
+        gfx_FillRectangle(cursor_px, y + 44, 2, 15);
+    }
+
+    char mode[24];
+    snprintf(mode, sizeof(mode), "%s%s",
+             edit_alpha_lock ? "ALPHA" : "abc",
+             edit_symbol_next ? " +SYM" : "");
+    gfx_SetTextFGColor(BLUE);
+    gfx_PrintStringXY(mode, x + 10, y + 70);
+
+    gfx_SetTextFGColor(SHADOW);
+    gfx_PrintStringXY("Alpha=letters  2nd=symbol  Del=erase", x + 10, y + 84);
+    gfx_PrintStringXY("Enter=OK  Clear=Cancel  HTTPS auto", x + 10, y + 96);
+
+    draw_toolbar_button(x + 56, y + 108, 68, "", "OK");
+    draw_toolbar_button(x + 140, y + 108, 68, "", "Cancel");
+}
+
+static void draw_help_dialog(void) {
+    int x = 24;
+    int y = 49;
+    int w = 272;
+    int h = 147;
+
+    draw_document();
+    draw_3d_button(x, y, w, h, false, false, true);
+    gfx_SetColor(BLUE);
+    gfx_FillRectangle(x + 2, y + 2, w - 4, 16);
+    gfx_SetTextFGColor(WHITE);
+    gfx_PrintStringXY("Microsoft Internet Explorer Help", x + 7, y + 6);
+
+    gfx_SetTextFGColor(BLACK);
+    gfx_PrintStringXY("2nd     Open URL", x + 10, y + 28);
+    gfx_PrintStringXY("Mode    Back", x + 10, y + 40);
+    gfx_PrintStringXY("Del     Forward", x + 10, y + 52);
+    gfx_PrintStringXY("Alpha   Toggle mouse mode", x + 10, y + 64);
+    gfx_PrintStringXY("+ / -   Scroll", x + 10, y + 76);
+    gfx_PrintStringXY("/ / *   Page scroll", x + 10, y + 88);
+    gfx_PrintStringXY("Mouse   Arrows move / Enter click", x + 10, y + 100);
+    gfx_PrintStringXY("Enter   Activate control", x + 10, y + 112);
+    gfx_PrintStringXY("Y=/Win/Zoom/Trace/Graph = tabs", x + 10, y + 124);
+    gfx_PrintStringXY("Clear   Exit", x + 10, y + 136);
+}
+
+static void draw_about_dialog(void) {
+    int x = 47;
+    int y = 74;
+    int w = 226;
+    int h = 93;
+
+    draw_document();
+    draw_3d_button(x, y, w, h, false, false, true);
+    gfx_SetColor(BLUE);
+    gfx_FillRectangle(x + 2, y + 2, w - 4, 16);
+    gfx_SetTextFGColor(WHITE);
+    gfx_PrintStringXY("About Internet Explorer", x + 7, y + 6);
+
+    gfx_SetColor(WHITE);
+    gfx_FillRectangle(x + 7, y + 27, 30, 30);
+    draw_logo_ie(x + 22, y + 42, 2);
+    draw_logo_chip(x + 26, y + 48);
+
+    gfx_SetTextFGColor(BLACK);
+    gfx_PrintStringXY("Gossamer CE", x + 42, y + 34);
+    gfx_PrintStringXY("Windows 98 / IE style", x + 42, y + 47);
+    gfx_PrintStringXY("XIAO ESP32-C3 USB bridge", x + 42, y + 60);
+    gfx_PrintStringXY("GET/LINK/TEXT/ERROR/END", x + 42, y + 73);
+}
+
+static void draw_mouse_cursor(void) {
+    if (!mouse_mode) return;
+
+    int x = mouse_x;
+    int y = mouse_y;
+
+    gfx_SetColor(BLACK);
+    gfx_Line(x, y, x, y + 15);
+    gfx_Line(x, y, x + 10, y + 10);
+    gfx_Line(x + 10, y + 10, x + 6, y + 10);
+    gfx_Line(x + 6, y + 10, x + 10, y + 17);
+
+    gfx_SetColor(WHITE);
+    gfx_Line(x + 2, y + 3, x + 2, y + 12);
+    gfx_Line(x + 2, y + 3, x + 8, y + 9);
+    gfx_Line(x + 8, y + 9, x + 5, y + 9);
+    gfx_Line(x + 5, y + 9, x + 8, y + 15);
+}
+
+static bool point_in_rect(int px, int py, int x, int y, int w, int h) {
+    return px >= x && px < x + w && py >= y && py < y + h;
+}
+
+static void mouse_set_position(int x, int y) {
+    
+    if (x < 1) x = 1;
+    if (y < 1) y = 1;
+    if (x > 308) x = 308;
+    if (y > 220) y = 220;
+    mouse_x = (int16_t)x;
+    mouse_y = (int16_t)y;
+}
+
+static void mouse_move(int dx, int dy) {
+    mouse_set_position(mouse_x + dx * mouse_speed,
+                       mouse_y + dy * mouse_speed);
+}
+
+static void mouse_open_menu_at(int x) {
+    for (uint8_t i = 0; i < 7; ++i) {
+        int mx = menu_x(i);
+        static const uint8_t mw[7] = {28, 30, 30, 26, 62, 37, 37};
+        int width = mw[i];
+        if (x >= mx - 2 && x < mx - 2 + width) {
+            menu_open = true;
+            menu_index = i;
+            menu_item = 0;
+            return;
+        }
+    }
+}
+
+static void mouse_click_toolbar(int x, int y) {
+    int ty = TITLE_H + MENU_H;
+    int xpos = 2;
+    int widths[8] = {38, 38, 38, 38, 38, 38, 38, 38};
+
+    if (y < ty + 2 || y >= ty + TOOL_H - 3) return;
+
+    for (uint8_t i = 0; i < 8; ++i) {
+        if (x >= xpos && x < xpos + widths[i]) {
+            focus_control = (int8_t)i;
+            activate_control(i);
+            return;
+        }
+        xpos += widths[i] + 2;
+    }
+}
+
+static void mouse_click_document(void) {
+    int cx = (active_pane == PANE_NONE) ? 2 : 90;
+    int cw = (active_pane == PANE_NONE) ? 316 : 228;
+
+    if (active_pane != PANE_NONE &&
+        point_in_rect(mouse_x, mouse_y, 2, CONTENT_Y, 86, CONTENT_H)) {
+        if (mouse_y >= CONTENT_Y + 22) {
+            int item = (mouse_y - (CONTENT_Y + 22)) / 12;
+            if (active_pane == PANE_FAVORITES && item < favorite_count && item < 8) {
+                pane_selection = (uint8_t)item;
+                pane_select_open();
+                return;
+            }
+            if (active_pane == PANE_HISTORY && item < back_count && item < 8) {
+                pane_selection = (uint8_t)item;
+                pane_select_open();
+                return;
+            }
+            if (active_pane == PANE_SEARCH) {
+                if (mouse_y >= CONTENT_Y + 22 && mouse_y < CONTENT_Y + 33) {
+                    pane_selection = 0;
+                    pane_select_open();
+                    return;
+                }
+                if (mouse_y >= CONTENT_Y + 51) {
+                    int recent = (mouse_y - (CONTENT_Y + 51)) / 11;
+                    if (recent >= 0 && recent < recent_search_count && recent < 6) {
+                        pane_selection = (uint8_t)(recent + 1);
+                        pane_select_open();
+                        return;
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    if (mouse_x >= cx + cw - SCROLL_W &&
+        mouse_y >= CONTENT_Y && mouse_y < CONTENT_Y + CONTENT_H) {
+        int rel = mouse_y - CONTENT_Y;
+        if (rel < 16) {
+            page_scroll(-1);
+        } else if (rel >= CONTENT_H - 16) {
+            page_scroll(1);
+        } else if (line_count > VISIBLE_LINES) {
+            int track = CONTENT_H - 28;
+            int thumb_h = track * VISIBLE_LINES / line_count;
+            if (thumb_h < 13) thumb_h = 13;
+            int max_offset = line_count - VISIBLE_LINES;
+            int pos = rel - 14 - thumb_h / 2;
+            if (pos < 0) pos = 0;
+            if (pos > track - thumb_h) pos = track - thumb_h;
+            first_line = (uint16_t)((max_offset * pos) / (track - thumb_h));
+        }
+        return;
+    }
+
+    if (point_in_rect(mouse_x, mouse_y, cx, CONTENT_Y, cw - SCROLL_W, CONTENT_H)) {
+        int media_row = (mouse_y - (CONTENT_Y + 7)) / LINE_H;
+        if (media_row >= 0 && media_row < VISIBLE_LINES) {
+            uint16_t media_idx = first_line + (uint16_t)media_row;
+            if (media_idx < line_count) {
+                int mid = media_token(lines[media_idx]);
+                if (mid > 0) {
+                    click_media((uint8_t)mid);
+                    return;
+                }
+            }
+        }
+    }
+
+    if (point_in_rect(mouse_x, mouse_y, cx, CONTENT_Y, cw - SCROLL_W, CONTENT_H)) {
+        int row = (mouse_y - (CONTENT_Y + 7)) / LINE_H;
+        if (row >= 0 && row < VISIBLE_LINES) {
+            uint16_t idx = first_line + (uint16_t)row;
+            if (idx < line_count) {
+                const char *line = lines[idx];
+                int px = cx + 5;
+                const char *p = line;
+                while (*p) {
+                    if (*p == '[' && p[1] >= '1' && p[1] <= '9' && p[2] == ']') {
+                        uint8_t n = (uint8_t)(p[1] - '0');
+                        if (point_in_rect(mouse_x, mouse_y, px - 1,
+                                          CONTENT_Y + 7 + row * LINE_H - 1, 18, 10)) {
+                            selected_link = (int8_t)n;
+                            if (n >= 1 && n <= link_count)
+                                fetch_url(links[n - 1]);
+                            return;
+                        }
+                        px += 18;
+                        p += 3;
+                    } else {
+                        px += 7;
+                        ++p;
+                    }
+                }
+                selected_link = -1;
+            }
+        }
+    }
+}
+
+static void mouse_click(void) {
+
+    if (showing_help || showing_about || showing_url_dialog) return;
+
+    int menuy = TITLE_H;
+    if (mouse_y >= menuy && mouse_y < menuy + MENU_H) {
+        mouse_open_menu_at(mouse_x);
+        return;
+    }
+
+    if (menu_open) {
+        int mx = menu_x(menu_index) - 2;
+        int mw = (menu_index == 4) ? 130 : 124;
+        uint8_t count = menu_count(menu_index);
+        int mh = count * 14 + 6;
+        int my = TITLE_H + MENU_H;
+        if (mx < 0) mx = 0;
+        if (mx + mw > 319) mx = 319 - mw;
+
+        if (point_in_rect(mouse_x, mouse_y, mx, my, mw, mh)) {
+            int item = (mouse_y - my - 3) / 14;
+            if (item >= 0 && item < count) {
+                menu_item = (uint8_t)item;
+                menu_action();
+            }
+        } else {
+            menu_open = false;
+        }
+        return;
+    }
+
+    mouse_click_toolbar(mouse_x, mouse_y);
+    if (mouse_y >= TITLE_H + MENU_H &&
+        mouse_y < TITLE_H + MENU_H + TOOL_H) {
+        return;
+    }
+
+    int address_y = TITLE_H + MENU_H + TOOL_H;
+    if (point_in_rect(mouse_x, mouse_y, 45, address_y + 2, 252, 16)) {
+        focus_control = 8;
+        open_url_dialog();
+        return;
+    }
+    if (point_in_rect(mouse_x, mouse_y, 299, address_y + 2, 18, 16)) {
+        focus_control = 9;
+        fetch_url(url);
+        return;
+    }
+
+    int tab_y = address_y + URL_H;
+    if (mouse_y >= tab_y && mouse_y < tab_y + TAB_H) {
+        uint8_t t = (uint8_t)(mouse_x / 64);
+        if (t < 5) {
+            focus_control = (int8_t)(10 + t);
+            switch_tab(t);
+        }
+        return;
+    }
+
+    mouse_click_document();
+}
+
+static void redraw(void) {
+    gfx_SetDrawBuffer();
+
+    gfx_SetColor(MID);
+    gfx_FillScreen(MID);
+
+    draw_titlebar();
+    draw_menubar();
+    draw_toolbar();
+    draw_address_bar();
+    draw_tabs();
+    draw_document();
+    draw_statusbar();
+
+    if (menu_open)
+        draw_dropdown();
+
+    if (showing_url_dialog)
+        draw_url_dialog();
+    else if (showing_help)
+        draw_help_dialog();
+    else if (showing_about)
+        draw_about_dialog();
+
+    draw_mouse_cursor();
+
+    gfx_SwapDraw();
+}
+
+static void parse_bridge_line(const char *line) {
+    if (!strncmp(line, "BEGIN", 5)) {
+        clear_page();
+        show_error = false;
+        loading = true;
+        set_status("Receiving page...");
+        redraw();
+        return;
+    }
+
+    if (!strncmp(line, "LINK ", 5)) {
+        unsigned n = 0;
+        char href[MAX_LINK_LEN];
+
+        if (sscanf(line, "LINK %u %239s", &n, href) == 2 &&
+            n >= 1 && n <= MAX_LINKS) {
+            strncpy(links[n - 1], href, MAX_LINK_LEN - 1);
+            links[n - 1][MAX_LINK_LEN - 1] = '\0';
+            if (n > link_count)
+                link_count = (uint8_t)n;
+        }
+        return;
+    }
+
+    if (!strncmp(line, "TEXT ", 5)) {
+        append_text(line + 5);
+        append_text("\n");
+        return;
+    }
+
+    if (!strncmp(line, "IMAGE ", 6)) {
+        append_media_element(MEDIA_IMAGE, line + 6, "Remote image");
+        return;
+    }
+
+    if (!strncmp(line, "VIDEO ", 6)) {
+        append_media_element(MEDIA_VIDEO, line + 6, "Remote video");
+        return;
+    }
+
+    if (!strncmp(line, "ERROR ", 6)) {
+        clear_page();
+        strncpy(error_message, line + 6, sizeof(error_message) - 1);
+        error_message[sizeof(error_message) - 1] = '\0';
+        show_error = true;
+        loading = false;
+        set_status("Page could not be displayed");
+        redraw();
+        return;
+    }
+
+    if (!strcmp(line, "END")) {
+        loading = false;
+        show_error = false;
+        first_line = 0;
+        selected_link = -1;
+        set_status("Done");
+        save_active_tab();
+        redraw();
+        return;
+    }
+}
+
+static void poll_serial(void) {
+    if (!bridge.open) return;
+
+    uint8_t buf[128];
+    int got = srl_Read(&bridge.srl, buf, sizeof(buf));
+    if (got <= 0) return;
+
+    for (int i = 0; i < got; ++i) {
+        char c = (char)buf[i];
+        if (c == '\r') continue;
+
+        if (c == '\n') {
+            rx_line[rx_len] = '\0';
+            parse_bridge_line(rx_line);
+            rx_len = 0;
+        } else if (rx_len < sizeof(rx_line) - 1) {
+            rx_line[rx_len++] = c;
+        }
+    }
+}
+
+static void press_control(uint8_t control) {
+    pressed_control = (int8_t)control;
+    pressed_frames = 3;
+}
+
+static void open_url_dialog(void) {
+    char tmp[240];
+    char normalized[240];
+
+    strncpy(tmp, url, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
+
+    if (custom_text_input(tmp, sizeof(tmp), false) && tmp[0]) {
+        normalize_url_input(tmp, normalized, sizeof(normalized));
+        if (normalized[0]) {
+            fetch_url(normalized);
+        }
+    }
+}
+
+static void open_help(void) {
+    showing_help = true;
+    redraw();
+
+    while (showing_help && running) {
+        usb_HandleEvents();
+        poll_serial();
+
+        uint8_t k = os_GetCSC();
+        if (k == KEY_EXIT || k == sk_Enter || k == KEY_SEARCH) {
+            showing_help = false;
+            redraw();
+        }
+    }
+}
+
+static void open_about(void) {
+    showing_about = true;
+    redraw();
+
+    while (showing_about && running) {
+        usb_HandleEvents();
+        poll_serial();
+
+        uint8_t k = os_GetCSC();
+        if (k == KEY_EXIT || k == sk_Enter || k == KEY_MENU) {
+            showing_about = false;
+            redraw();
+        }
+    }
+}
+
+static void scroll_lines(int amount) {
+    int next = (int)first_line + amount;
+
+    if (next < 0) next = 0;
+
+    if (line_count > VISIBLE_LINES &&
+        next > (int)line_count - VISIBLE_LINES) {
+        next = line_count - VISIBLE_LINES;
+    }
+
+    if (line_count <= VISIBLE_LINES)
+        next = 0;
+
+    first_line = (uint16_t)next;
+}
+
+static void page_scroll(int direction) {
+    scroll_lines(direction * (VISIBLE_LINES - 2));
+}
+
+static void select_link(int delta) {
+    if (!link_count) return;
+
+    int n = selected_link;
+
+    if (n < 1) {
+        n = delta > 0 ? 1 : link_count;
+    } else {
+        n += delta;
+        if (n < 1) n = link_count;
+        if (n > link_count) n = 1;
+    }
+
+    selected_link = (int8_t)n;
+}
+
+static void pane_select_open(void) {
+    if (active_pane == PANE_FAVORITES) {
+        if (pane_selection < favorite_count)
+            fetch_url(favorites[pane_selection]);
+    } else if (active_pane == PANE_HISTORY) {
+        if (pane_selection < back_count)
+            fetch_url(back_stack[back_count - 1 - pane_selection]);
+    } else if (active_pane == PANE_SEARCH) {
+        if (pane_selection == 0) {
+            search_web();
+        } else if (pane_selection - 1 < recent_search_count) {
+            char search_url[240];
+            char encoded[120];
+            uint16_t j = 0;
+            const char *q = recent_search[pane_selection - 1];
+            for (uint16_t i = 0; q[i] && j < sizeof(encoded) - 1; ++i) {
+                char c = q[i];
+                if (c == ' ') c = '+';
+                encoded[j++] = c;
+            }
+            encoded[j] = '\0';
+            snprintf(search_url, sizeof(search_url), "https://www.google.com/search?q=%s", encoded);
+            fetch_url(search_url);
+        }
+    }
+}
+
+static void activate_control(uint8_t control) {
+    press_control(control);
+
+    if (control <= 7) {
+        switch (control) {
+            case 0: go_back(); break;
+            case 1: go_forward(); break;
+            case 2: stop_loading(); break;
+            case 3: refresh_page(); break;
+            case 4: go_home(); break;
+            case 5: active_pane = PANE_FAVORITES; pane_selection = 0; break;
+            case 6: active_pane = PANE_SEARCH; pane_selection = 0; search_web(); break;
+            case 7: open_help(); break;
+        }
+        return;
+    }
+
+    if (control == 8) {
+        open_url_dialog();
+        return;
+    }
+
+    if (control == 9) {
+        fetch_url(url);
+        return;
+    }
+
+    if (control >= 10 && control <= 14) {
+        switch_tab((uint8_t)(control - 10));
+        return;
+    }
+
+    if (control == 15) {
+        if (selected_link >= 1 && selected_link <= link_count)
+            fetch_url(links[selected_link - 1]);
+        else
+            select_link(1);
+    }
+}
+
+static void move_focus(int delta) {
+    int next = focus_control;
+
+    next += delta;
+
+    if (next < 0) next = 15;
+    if (next > 15) next = 0;
+
+    focus_control = (int8_t)next;
+}
+
+static void menu_action(void) {
+    switch (menu_index) {
+        case 0:
+            switch (menu_item) {
+                case 0: open_url_dialog(); break;
+                case 1: new_tab(); break;
+                case 2: close_tab(); break;
+                case 3: add_favorite_current(); break;
+                case 4: running = false; break;
+            }
+            break;
+
+        case 1:
+            switch (menu_item) {
+                case 0: open_url_dialog(); break;
+                case 1: back_count = 0; set_status("History cleared"); break;
+                case 2: forward_count = 0; set_status("Forward history cleared"); break;
+            }
+            break;
+
+        case 2:
+            switch (menu_item) {
+                case 0: refresh_page(); break;
+                case 1: stop_loading(); break;
+                case 2: active_pane = PANE_FAVORITES; pane_selection = 0; break;
+                case 3: active_pane = PANE_HISTORY; pane_selection = 0; break;
+                case 4: active_pane = PANE_SEARCH; pane_selection = 0; break;
+            }
+            break;
+
+        case 3:
+            switch (menu_item) {
+                case 0: go_back(); break;
+                case 1: go_forward(); break;
+                case 2: go_home(); break;
+                case 3: open_url_dialog(); break;
+            }
+            break;
+
+        case 4:
+            switch (menu_item) {
+                case 0: active_pane = PANE_FAVORITES; pane_selection = 0; break;
+                case 1: add_favorite_current(); break;
+            }
+            break;
+
+        case 5:
+            switch (menu_item) {
+                case 0: active_pane = PANE_SEARCH; pane_selection = 0; search_web(); break;
+                case 1: set_status(bridge.open ? "XIAO bridge connected" : "XIAO bridge offline"); break;
+                case 2: open_about(); break;
+            }
+            break;
+
+        default:
+            switch (menu_item) {
+                case 0: open_help(); break;
+                case 1: open_about(); break;
+            }
+            break;
+    }
+
+    menu_open = false;
+}
+
+static void handle_menu_key(uint8_t key) {
+    if (key == KEY_EXIT) {
+        menu_open = false;
+        redraw();
+        return;
+    }
+
+    if (key == sk_Left) {
+        if (menu_index > 0) --menu_index;
+        else menu_index = 6;
+        menu_item = 0;
+        return;
+    }
+
+    if (key == sk_Right) {
+        if (menu_index < 6) ++menu_index;
+        else menu_index = 0;
+        menu_item = 0;
+        return;
+    }
+
+    if (key == sk_Up) {
+        uint8_t count = menu_count(menu_index);
+        if (menu_item > 0) --menu_item;
+        else menu_item = count ? count - 1 : 0;
+        return;
+    }
+
+    if (key == sk_Down) {
+        uint8_t count = menu_count(menu_index);
+        if (count) {
+            if (menu_item + 1 < count) ++menu_item;
+            else menu_item = 0;
+        }
+        return;
+    }
+
+    if (key == sk_Enter) {
+        menu_action();
+        return;
+    }
+}
+
+static void animate_video_if_needed(void) {
+    static uint8_t ticks = 0;
+
+    if (!media_count) return;
+
+    bool any = false;
+    for (uint8_t i = 0; i < media_count; ++i) {
+        if (media[i].type == MEDIA_VIDEO && media[i].playing) {
+            any = true;
+            break;
+        }
+    }
+
+    if (!any) return;
+
+    ++ticks;
+    if (ticks < 5) return;
+    ticks = 0;
+
+    for (uint8_t i = 0; i < media_count; ++i) {
+        if (media[i].type == MEDIA_VIDEO && media[i].playing)
+            media[i].frame = (uint8_t)((media[i].frame + 1) % 20);
+    }
+
+    redraw();
+}
+
+static void handle_keys(void) {
+    uint8_t key = os_GetCSC();
+    if (!key) return;
+
+    if (menu_open) {
+        handle_menu_key(key);
+        redraw();
+        return;
+    }
+
+    if (key == KEY_MOUSE) {
+        mouse_mode = !mouse_mode;
+        set_status(mouse_mode ? "Mouse mode ON - arrows move, Enter clicks"
+                              : "Keyboard mode");
+        redraw();
+        return;
+    }
+
+    if (mouse_mode) {
+        if (key == sk_Left) { mouse_move(-1, 0); redraw(); return; }
+        if (key == sk_Right) { mouse_move(1, 0); redraw(); return; }
+        if (key == sk_Up) { mouse_move(0, -1); redraw(); return; }
+        if (key == sk_Down) { mouse_move(0, 1); redraw(); return; }
+        if (key == sk_Enter) { mouse_click(); redraw(); return; }
+        if (key == KEY_PAGE_UP) { page_scroll(-1); redraw(); return; }
+        if (key == KEY_PAGE_DOWN) { page_scroll(1); redraw(); return; }
+    }
+
+    if (key == KEY_EXIT) {
+        running = false;
+        return;
+    }
+
+    if (key == KEY_MENU) {
+        menu_open = true;
+        menu_index = 0;
+        menu_item = 0;
+        return;
+    }
+
+    if (key == KEY_URL) {
+        open_url_dialog();
+        return;
+    }
+
+    if (key == KEY_SEARCH) {
+        active_pane = PANE_SEARCH;
+        search_web();
+        redraw();
+        return;
+    }
+
+    if (key == KEY_BACK) {
+        if (active_pane != PANE_NONE) {
+            active_pane = PANE_NONE;
+            pane_selection = 0;
+            wrap_page();
+        } else {
+            go_back();
+        }
+        redraw();
+        return;
+    }
+
+    if (key == KEY_FORWARD) {
+        go_forward();
+        redraw();
+        return;
+    }
+
+    if (key == TAB_1_KEY) {
+        switch_tab(0);
+        redraw();
+        return;
+    }
+    if (key == TAB_2_KEY) {
+        switch_tab(1);
+        redraw();
+        return;
+    }
+    if (key == TAB_3_KEY) {
+        switch_tab(2);
+        redraw();
+        return;
+    }
+    if (key == TAB_4_KEY) {
+        switch_tab(3);
+        redraw();
+        return;
+    }
+    if (key == TAB_5_KEY) {
+        switch_tab(4);
+        redraw();
+        return;
+    }
+
+    if (key == sk_Left) {
+        if (focus_control == 15) select_link(-1);
+        else move_focus(-1);
+        redraw();
+        return;
+    }
+
+    if (key == sk_Right) {
+        if (focus_control == 15) select_link(1);
+        else move_focus(1);
+        redraw();
+        return;
+    }
+
+    if (key == sk_Up) {
+        if (active_pane == PANE_FAVORITES) {
+            if (pane_selection > 0) --pane_selection;
+        } else if (active_pane == PANE_HISTORY) {
+            if (pane_selection > 0) --pane_selection;
+        } else if (active_pane == PANE_SEARCH) {
+            if (pane_selection > 0) --pane_selection;
+        } else {
+            scroll_lines(-1);
+        }
+        redraw();
+        return;
+    }
+
+    if (key == sk_Down) {
+        if (active_pane == PANE_FAVORITES) {
+            if (favorite_count && pane_selection + 1 < favorite_count && pane_selection < 7) ++pane_selection;
+        } else if (active_pane == PANE_HISTORY) {
+            if (back_count && pane_selection + 1 < back_count && pane_selection < 7) ++pane_selection;
+        } else if (active_pane == PANE_SEARCH) {
+            if (pane_selection < recent_search_count && pane_selection < 6) ++pane_selection;
+        } else {
+            scroll_lines(1);
+        }
+        redraw();
+        return;
+    }
+
+    if (key == KEY_PAGE_UP) {
+        page_scroll(-1);
+        redraw();
+        return;
+    }
+
+    if (key == KEY_PAGE_DOWN) {
+        page_scroll(1);
+        redraw();
+        return;
+    }
+
+    if (key == sk_Enter) {
+        if (active_pane != PANE_NONE)
+            pane_select_open();
+        else
+            activate_control((uint8_t)focus_control);
+        redraw();
+        return;
+    }
+
+    if (key == sk_1 || key == sk_2 || key == sk_3 ||
+        key == sk_4 || key == sk_5 || key == sk_6 ||
+        key == sk_7 || key == sk_8 || key == sk_9) {
+        int n = key - sk_1 + 1;
+        if (n >= 1 && n <= link_count) {
+            selected_link = (int8_t)n;
+            fetch_url(links[n - 1]);
+        }
+        redraw();
+        return;
+    }
+}
+
+int main(void) {
+    memset(&bridge, 0, sizeof(bridge));
+    memset(tabs, 0, sizeof(tabs));
+    memset(back_stack, 0, sizeof(back_stack));
+    memset(forward_stack, 0, sizeof(forward_stack));
+    memset(recent_search, 0, sizeof(recent_search));
+
+    for (uint8_t i = 0; i < 5; ++i)
+        reset_tab(i);
+
+    tabs[0].used = true;
+    strncpy(tabs[0].url, url, sizeof(tabs[0].url) - 1);
+    tabs[0].url[sizeof(tabs[0].url) - 1] = '\0';
+    make_tab_title(0);
+
+    gfx_Begin();
+    gfx_SetDrawBuffer();
+    kb_SetMode(MODE_3_CONTINUOUS);
+
+    usb_Init(
+        usb_callback,
+        &bridge,
+        NULL,
+        USB_DEFAULT_INIT_FLAGS
+    );
+
+    clear_page();
+    set_status("Connect the XIAO by USB");
+    redraw();
+
+    while (running) {
+        usb_HandleEvents();
+
+        if (pressed_frames) {
+            --pressed_frames;
+            if (!pressed_frames)
+                pressed_control = -1;
+        }
+
+        if (!bridge.open && bridge.device) {
+            if (ensure_serial()) {
+                set_status("XIAO connected");
+                if (!page_text[0] && !loading)
+                    fetch_url(url);
+                redraw();
+            }
+        }
+
+        poll_serial();
+        handle_keys();
+        animate_video_if_needed();
+
+        if (loading)
+            redraw();
+    }
+
+    if (bridge.open)
+        srl_Close(&bridge.srl);
+
+    usb_Cleanup();
+    gfx_End();
+
+    return 0;
+}
